@@ -12,6 +12,7 @@ BUSYBOX_VERSION=1_33_1
 FINDER_APP_DIR=$(realpath $(dirname $0))
 ARCH=arm64
 CROSS_COMPILE=aarch64-none-linux-gnu-
+ARM_TOOLCHAIN_BASE="/home/vijaykum/arm-cross-compiler/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu/aarch64-none-linux-gnu"
 
 if [ $# -lt 1 ]
 then
@@ -22,6 +23,7 @@ else
 fi
 
 mkdir -p ${OUTDIR}
+cp ${ARM_TOOLCHAIN_BASE}/libc/lib/ld-linux-aarch64.so.1 ${FINDER_APP_DIR}/.
 
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/linux-stable" ]; then
