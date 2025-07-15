@@ -23,6 +23,7 @@ else
 fi
 
 mkdir -p ${OUTDIR}
+cp ${ARM_TOOLCHAIN_PATH}/lib/ld-linux-aarch64.so.1 ${OUTDIR}/.
 
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/linux-stable" ]; then
