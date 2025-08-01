@@ -11,7 +11,7 @@ WRITEDIR=/tmp/aeld-data
 
 # For Assignment 4
 #username=$(cat conf/username.txt)
-username=$($(TARGET_DIR)/etc/finder-app/conf/username.txt)
+username=$(cat /etc/finder-app/conf/username.txt)
 
 if [ $# -lt 3 ]
 then
@@ -38,7 +38,7 @@ rm -rf "${WRITEDIR}"
 
 # For Assignment 4
 #assignment=`cat conf/assignment.txt`
-assignment=$($(TARGET_DIR)/etc/finder-app/conf/assignment.txt)
+assignment=$(cat /etc/finder-app/conf/assignment.txt)
 
 if [ $assignment != 'assignment1' ]
 then
