@@ -1,4 +1,3 @@
-// C Program to create stream socket
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -81,22 +80,40 @@ int create_listening_socket() {
     struct sockaddr_in address;
     int opt = 1;
 
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) {
         syslog(LOG_ERR, "socket failed: %s", strerror(errno));
         return -1;
     }
 
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
-        syslog(LOG_ERR, "setsockopt failed: %s", strerror(errno));
+        syslog(LOG_ERR, "setsockopt SO_REUSEADDR failed: %s", strerror(errno));
         close(server_fd);
         return -1;
     }
+#ifdef SO_REUSEPORT
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == -1) {
+        syslog(LOG_ERR, "setsockopt SO_REUSEPORT failed: %s", strerror(errno));
+        close(server_fd);
+        return -1;
+    }
+#endif
 
+    memset(&address, 0, sizeof(address));              
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    // Retry bind a few times to tolerate fast restarts
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) == 0) {
+            break; // success
+        }
+        if (errno == EADDRINUSE) {
+            syslog(LOG_WARNING, "bind EADDRINUSE, retrying...");
+            usleep(200 * 1000); // 200ms backoff
+            continue;
+        }
         syslog(LOG_ERR, "bind failed: %s", strerror(errno));
         close(server_fd);
         return -1;
@@ -171,6 +188,10 @@ void *handle_connection(void *arg) {
             if (write(fd, packet_buffer, packet_len) == -1) {
                 syslog(LOG_ERR, "Failed to write to file %s: %s", DATA_FILE, strerror(errno));
             }
+            
+            if (fsync(fd) == -1) {
+                syslog(LOG_ERR, "fsync failed: %s", strerror(errno));
+            }
             close(fd);
             
             // Unlock the mutex after writing
@@ -189,22 +210,25 @@ void *handle_connection(void *arg) {
                 syslog(LOG_ERR, "Failed to open file %s for reading: %s", DATA_FILE, strerror(errno));
             } else {
                 char file_buffer[BUFFER_SIZE];
-                ssize_t read_bytes = 0;
-                while (!g_exit_signal_received && (read_bytes = read(read_fd, file_buffer, BUFFER_SIZE)) > 0) {
+                ssize_t read_bytes_from_file = 0;
+                
+		lseek(read_fd, 0, SEEK_SET);
+
+                while (!g_exit_signal_received && (read_bytes_from_file = read(read_fd, file_buffer, BUFFER_SIZE)) > 0) {
                     ssize_t sent_bytes = 0;
-                    while (sent_bytes < read_bytes) {
-                        ssize_t current_sent = send(client_socket, file_buffer + sent_bytes, read_bytes - sent_bytes, 0);
+                    while (sent_bytes < read_bytes_from_file) {
+                        ssize_t current_sent = send(client_socket, file_buffer + sent_bytes, read_bytes_from_file - sent_bytes, 0);
                         if (current_sent == -1) {
                             syslog(LOG_ERR, "send failed: %s", strerror(errno));
                             break;
                         }
                         sent_bytes += current_sent;
                     }
-                    if (sent_bytes < read_bytes) {
+                    if (sent_bytes < read_bytes_from_file) {
                         break;
                     }
                 }
-                if (read_bytes == -1) {
+                if (read_bytes_from_file == -1) {
                      syslog(LOG_ERR, "read failed on file %s: %s", DATA_FILE, strerror(errno));
                 }
                 close(read_fd);
@@ -219,8 +243,28 @@ void *handle_connection(void *arg) {
             packet_buffer_len = remaining_len;
         }
     }
-
-    if (bytes_received == -1 && errno != EINTR) {
+    
+    // Check if connection was closed with data still in buffer
+    if (bytes_received == 0 && packet_buffer_len > 0) {
+        if (pthread_mutex_lock(&file_mutex) == 0) {
+            int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd != -1) {
+                if (write(fd, packet_buffer, packet_buffer_len) == -1) {
+                     syslog(LOG_ERR, "Failed to write remaining data to file %s: %s", DATA_FILE, strerror(errno));
+                }
+                
+                if (fsync(fd) == -1) {
+                    syslog(LOG_ERR, "fsync failed: %s", strerror(errno));
+                }
+                close(fd);
+            } else {
+                 syslog(LOG_ERR, "Failed to open file for remaining data %s: %s", DATA_FILE, strerror(errno));
+            }
+            pthread_mutex_unlock(&file_mutex);
+        } else {
+            syslog(LOG_ERR, "Failed to lock mutex for final write: %s", strerror(errno));
+        }
+    } else if (bytes_received == -1 && errno != EINTR) {
         syslog(LOG_ERR, "recv failed: %s", strerror(errno));
     }
 
@@ -280,6 +324,9 @@ void *timestamp_thread(void *arg) {
             syslog(LOG_ERR, "Failed to write timestamp to file %s: %s", DATA_FILE, strerror(errno));
         }
         
+        if (fsync(fd) == -1) {
+            syslog(LOG_ERR, "fsync failed for timestamp: %s", strerror(errno));
+        }
         close(fd);
         
         // Unlock the mutex
@@ -297,7 +344,6 @@ int main(int argc, char *argv[]) {
     socklen_t client_addr_size = sizeof(client_address);
     int daemon_mode = 0;
 
-    // Check for the -d argument
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0) {
             daemon_mode = 1;
@@ -305,56 +351,52 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    signal(SIGPIPE, SIG_IGN);
+
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
+    if (daemon_mode) {
+        
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            syslog(LOG_ERR, "fork failed: %s", strerror(errno));
+            closelog();
+            return 1;
+        }
+        
+        if (pid > 0) {
+            syslog(LOG_INFO, "Daemonizing parent process is exiting");
+            closelog();
+            exit(0);
+        }
+	        
+        syslog(LOG_INFO, "Running as daemon");
+
+        if (setsid() < 0) {
+            syslog(LOG_ERR, "setsid failed: %s", strerror(errno));
+            exit(1);
+        }
+
+        if (chdir("/") < 0) {
+            syslog(LOG_ERR, "chdir failed: %s", strerror(errno));
+            exit(1);
+        }
+
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+    //sleep(2);
+    
+    }
+    
     listening_socket = create_listening_socket();
     if (listening_socket == -1) {
         syslog(LOG_ERR, "Failed to create listening socket. Exiting.");
         closelog();
         return 1;
     }
-
-    // Daemonization logic
-    if (daemon_mode) {
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            // Fork failed
-            syslog(LOG_ERR, "fork failed: %s", strerror(errno));
-            close(listening_socket);
-            closelog();
-            return 1;
-        }
-        
-        if (pid > 0) {
-            // Parent process exits
-            syslog(LOG_INFO, "Daemonizing parent process is exiting");
-            closelog();
-            exit(0);
-        }
-
-        // Child process continues as the daemon
-        syslog(LOG_INFO, "Running as daemon");
-
-        // Create a new session and become a session leader
-        if (setsid() < 0) {
-            syslog(LOG_ERR, "setsid failed: %s", strerror(errno));
-            exit(1);
-        }
-
-        // Change the current working directory to the root
-        if (chdir("/") < 0) {
-            syslog(LOG_ERR, "chdir failed: %s", strerror(errno));
-            exit(1);
-        }
-
-        // Close all standard file descriptors
-        close(STDIN_FILENO);
-        close(STDOUT_FILENO);
-        close(STDERR_FILENO);
-    }
     
-    // Initialize mutex
     if (pthread_mutex_init(&file_mutex, NULL) != 0) {
         syslog(LOG_ERR, "mutex init failed: %s", strerror(errno));
         close(listening_socket);
@@ -362,7 +404,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Register signal handler for SIGINT and SIGTERM
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
@@ -377,7 +418,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Create the timestamping thread
+	// At startup, ensure the data file is empty for a clean test run state
+	int init_fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (init_fd == -1) {
+    		syslog(LOG_ERR, "Failed to initialize %s: %s", DATA_FILE, strerror(errno));
+	} 	else {
+    		close(init_fd);
+	}
+
     if (pthread_create(&timestamp_thread_id, NULL, timestamp_thread, NULL) != 0) {
         syslog(LOG_ERR, "pthread_create for timestamp thread failed: %s", strerror(errno));
         pthread_mutex_destroy(&file_mutex);
@@ -386,22 +434,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    //sleep(2);
+
     syslog(LOG_INFO, "Listening for connections on port %d...", PORT);
 
     while (!g_exit_signal_received) {
         int client_socket = accept(listening_socket, (struct sockaddr *)&client_address, &client_addr_size);
         
-        // Check for interrupted system call
         if (client_socket == -1) {
             if (errno == EINTR) {
-                // The accept() call was interrupted by a signal, so we check our flag and continue or exit
                 continue;
             }
             syslog(LOG_ERR, "accept failed: %s", strerror(errno));
             continue;
         }
         
-        // Allocate memory for thread data and list node
         struct thread_data *data = malloc(sizeof(struct thread_data));
         if (data == NULL) {
             syslog(LOG_ERR, "malloc failed for thread data: %s", strerror(errno));
@@ -419,7 +466,6 @@ int main(int argc, char *argv[]) {
             continue;
         }
         
-        // Create a new thread to handle the connection
         if (pthread_create(&new_node->thread, NULL, handle_connection, data) != 0) {
             syslog(LOG_ERR, "pthread_create failed: %s", strerror(errno));
             free(new_node);
@@ -428,16 +474,14 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Add the new node to the singly linked list
         new_node->next = slist_head;
         slist_head = new_node;
         
-        // Clean up completed threads in the main loop
         struct slist_data_s *current = slist_head;
         struct slist_data_s *prev = NULL;
         while (current != NULL) {
             int join_result = pthread_tryjoin_np(current->thread, NULL);
-            if (join_result == 0) { // Thread has finished
+            if (join_result == 0) {
                 if (prev == NULL) {
                     slist_head = current->next;
                 } else {
@@ -446,10 +490,10 @@ int main(int argc, char *argv[]) {
                 struct slist_data_s *temp = current;
                 current = current->next;
                 free(temp);
-            } else if (join_result == EBUSY) { // Thread is still running
+            } else if (join_result == EBUSY) {
                 prev = current;
                 current = current->next;
-            } else { // An error occurred
+            } else {
                 syslog(LOG_ERR, "pthread_tryjoin_np failed: %s", strerror(join_result));
                 prev = current;
                 current = current->next;
@@ -457,20 +501,11 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // --- Graceful Exit and Cleanup ---
-    // Join the timestamping thread
     pthread_join(timestamp_thread_id, NULL);
-
-    // Join all remaining client handling threads
     join_all_threads();
-
-    // Close the listening socket
     close(listening_socket);
-
-    // Destroy the mutex
     pthread_mutex_destroy(&file_mutex);
     
-    // Delete the data file
     if (unlink(DATA_FILE) == -1) {
         syslog(LOG_ERR, "Failed to delete file %s: %s", DATA_FILE, strerror(errno));
     } else {
