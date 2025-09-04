@@ -18,10 +18,17 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+
+//modifications start
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+//modifications end
+
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
-MODULE_AUTHOR("Your Name Here"); /** TODO: fill in your name **/
+MODULE_AUTHOR("VijayKM3"); /** TODO: fill in your name **/
 MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
@@ -32,6 +39,21 @@ int aesd_open(struct inode *inode, struct file *filp)
     /**
      * TODO: handle open
      */
+     /* bind this file instance to our single device */
+    
+    //modifications start
+    filp->private_data = &aesd_device;
+
+    /* lazily allocate/init the device mutex once */
+    if (!aesd_device.lock) {
+        struct mutex *m = kmalloc(sizeof(*m), GFP_KERNEL);
+        if (!m)
+            return -ENOMEM;
+        mutex_init(m);
+        aesd_device.lock = m;
+    }
+    //modifications end
+     
     return 0;
 }
 
@@ -41,6 +63,8 @@ int aesd_release(struct inode *inode, struct file *filp)
     /**
      * TODO: handle release
      */
+    //modifications start
+    //modifications end
     return 0;
 }
 
@@ -52,6 +76,78 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     /**
      * TODO: handle read
      */
+    //modifications start
+    struct aesd_dev *dev = filp->private_data;
+    size_t want, copied = 0, pos = 0;
+    size_t remaining, idx, i;
+
+    if (!dev || !dev->lock)
+        return -EIO;
+
+    mutex_lock(dev->lock);
+
+    if (*f_pos >= dev->total_len) {
+        retval = 0;                /* EOF */
+        goto out_unlock;
+    }
+
+    remaining = dev->total_len - *f_pos;
+    want = (count < remaining) ? count : remaining;
+
+    /* allocate a staging buffer for up to 'want' bytes */
+    {
+        char *kbuf = kmalloc(want, GFP_KERNEL);
+        if (!kbuf) {
+            retval = -ENOMEM;
+            goto out_unlock;
+        }
+
+        /* Walk the history in arrival order: oldest .. newest */
+        idx = dev->cmd_count == AESD_HISTORY_MAX ? dev->head : 0;
+
+        for (i = 0; i < dev->cmd_count && copied < want; i++) {
+            size_t entry = (idx + i) % AESD_HISTORY_MAX;
+            size_t elen  = dev->cmd_len[entry];
+
+            /* Skip entries entirely before *f_pos */
+            if (pos + elen <= *f_pos) {
+                pos += elen;
+                continue;
+            }
+
+            /* Start within this entry */
+            {
+                size_t start_in_entry = (*f_pos > pos) ? (*f_pos - pos) : 0;
+                size_t avail_in_entry = elen - start_in_entry;
+                size_t take = (want - copied < avail_in_entry) ? (want - copied) : avail_in_entry;
+
+                memcpy(kbuf + copied,
+                       dev->cmd_data[entry] + start_in_entry,
+                       take);
+                copied += take;
+                pos += elen;
+            }
+        }
+
+        if (copied) {
+            if (copy_to_user(buf, kbuf, copied))
+                retval = -EFAULT;
+            else {
+                *f_pos += copied;
+                retval = copied;
+            }
+        } else {
+            retval = 0; /* nothing more to read */
+        }
+
+        kfree(kbuf);
+    }
+
+out_unlock:
+    mutex_unlock(dev->lock);
+    return retval;
+    //modifications end
+    
     return retval;
 }
 
@@ -63,6 +159,91 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     /**
      * TODO: handle write
      */
+    //modifications start
+    struct aesd_dev *dev = filp->private_data;
+    char *ubuf = NULL;
+    size_t off = 0;
+
+    if (!dev || !dev->lock)
+        return -EIO;
+
+    if (count == 0)
+        return 0;
+
+    ubuf = kmalloc(count, GFP_KERNEL);
+    if (!ubuf)
+        return -ENOMEM;
+
+    if (copy_from_user(ubuf, buf, count)) {
+        kfree(ubuf);
+        return -EFAULT;
+    }
+
+    mutex_lock(dev->lock);
+
+    /* Helper to append (bytes [s..e)) to dev->partial_buf */
+    #define APPEND_TO_PARTIAL(s,e)                                                   \
+        do {                                                                         \
+            size_t add = (e) - (s);                                                  \
+            char *nb = kmalloc(dev->partial_len + add, GFP_KERNEL);                  \
+            if (!nb) { retval = -ENOMEM; goto out_unlock_free; }                     \
+            if (dev->partial_len) memcpy(nb, dev->partial_buf, dev->partial_len);    \
+            memcpy(nb + dev->partial_len, (s), add);                                 \
+            kfree(dev->partial_buf);                                                 \
+            dev->partial_buf = nb;                                                   \
+            dev->partial_len += add;                                                 \
+        } while (0)
+
+    /* Helper to push a COMPLETE command in history (freeing oldest if needed) */
+    #define PUSH_COMPLETE()                                                          \
+        do {                                                                         \
+            size_t ins_idx;                                                          \
+            /* if we already have 10, drop the oldest */                             \
+            if (dev->cmd_count == AESD_HISTORY_MAX) {                                \
+                kfree(dev->cmd_data[dev->head]);                                     \
+                dev->total_len -= dev->cmd_len[dev->head];                           \
+                dev->head = (dev->head + 1) % AESD_HISTORY_MAX;                      \
+            } else {                                                                  \
+                dev->cmd_count++;                                                    \
+            }                                                                         \
+            ins_idx = (dev->head + dev->cmd_count - 1) % AESD_HISTORY_MAX;           \
+            dev->cmd_data[ins_idx] = dev->partial_buf;                               \
+            dev->cmd_len[ins_idx]  = dev->partial_len;                               \
+            dev->total_len        += dev->partial_len;                                \
+            dev->partial_buf = NULL;                                                 \
+            dev->partial_len = 0;                                                    \
+        } while (0)
+
+    /* Process the user buffer, possibly creating multiple complete commands
+     * split on '\n'. Bytes after the last '\n' remain in partial_buf. */
+    while (off < count) {
+        /* find next newline in ubuf[off..count) */
+        void *nlp = memchr(ubuf + off, '\n', count - off);
+        if (!nlp) {
+            /* all remaining data is partial */
+            APPEND_TO_PARTIAL(ubuf + off, ubuf + count);
+            off = count;
+            break;
+        }
+
+        /* append up to and including newline, then push as one complete command */
+        {
+            size_t upto = ((char *)nlp - (ubuf + off)) + 1; /* include '\n' */
+            APPEND_TO_PARTIAL(ubuf + off, ubuf + off + upto);
+            off += upto;
+            PUSH_COMPLETE();
+        }
+    }
+
+    retval = count; /* per character driver convention, report bytes accepted */
+
+    out_unlock_free:
+     mutex_unlock(dev->lock);
+     kfree(ubuf);
+     return retval;
+       
+    //modifications end
+     
     return retval;
 }
 struct file_operations aesd_fops = {
@@ -105,7 +286,16 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
-
+    //modifications start
+    /* initialize AESD-specific device state */
+    aesd_device.head       = 0;
+    aesd_device.cmd_count  = 0;
+    aesd_device.total_len  = 0;
+    aesd_device.partial_buf = NULL;
+    aesd_device.partial_len = 0;
+    aesd_device.lock        = NULL; /* allocated lazily in open() */
+    //modifications end
+    
     result = aesd_setup_cdev(&aesd_device);
 
     if( result ) {
@@ -124,10 +314,32 @@ void aesd_cleanup_module(void)
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
+    //modifications start
+    size_t i;
 
+    /* free all history entries */
+    for (i = 0; i < aesd_device.cmd_count; i++) {
+        size_t idx = (aesd_device.head + i) % AESD_HISTORY_MAX;
+        kfree(aesd_device.cmd_data[idx]);
+        aesd_device.cmd_data[idx] = NULL;
+        aesd_device.cmd_len[idx]  = 0;
+    }
+
+    /* free any in-progress partial buffer */
+    kfree(aesd_device.partial_buf);
+    aesd_device.partial_buf = NULL;
+    aesd_device.partial_len = 0;
+
+    /* free the mutex if allocated */
+    if (aesd_device.lock) {
+        /* no explicit destroy needed for struct mutex */
+        kfree(aesd_device.lock);
+        aesd_device.lock = NULL;
+    }
+    //modifications end
+    
     unregister_chrdev_region(devno, 1);
 }
-
 
 
 module_init(aesd_init_module);

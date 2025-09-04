@@ -14,9 +14,20 @@
 #include <pthread.h>
 #include <time.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
 #define PORT 9000
 #define BACKLOG 10
+
+#if USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
 #define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
+
+//#define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
 
 // Global flag to indicate that a signal has been received
@@ -35,7 +46,11 @@ struct slist_data_s {
 };
 struct slist_data_s *slist_head = NULL;
 
+#if !USE_AESD_CHAR_DEVICE
 pthread_t timestamp_thread_id;
+#endif
+
+//pthread_t timestamp_thread_id;
 
 /**
  * Data structure to pass to the thread.
@@ -287,6 +302,7 @@ void *handle_connection(void *arg) {
  * @param arg Not used.
  * @return NULL on completion.
  */
+#if !USE_AESD_CHAR_DEVICE 
 void *timestamp_thread(void *arg) {
     while (!g_exit_signal_received) {
         // Sleep for 10 seconds or until a signal is received
@@ -336,7 +352,7 @@ void *timestamp_thread(void *arg) {
     }
     return NULL;
 }
-
+#endif
 
 int main(int argc, char *argv[]) {
     int listening_socket;
@@ -426,6 +442,7 @@ int main(int argc, char *argv[]) {
     		close(init_fd);
 	}
 
+#if !USE_AESD_CHAR_DEVICE
     if (pthread_create(&timestamp_thread_id, NULL, timestamp_thread, NULL) != 0) {
         syslog(LOG_ERR, "pthread_create for timestamp thread failed: %s", strerror(errno));
         pthread_mutex_destroy(&file_mutex);
@@ -433,6 +450,7 @@ int main(int argc, char *argv[]) {
         closelog();
         return 1;
     }
+#endif
 
     //sleep(2);
 
@@ -501,16 +519,22 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    #if !USE_AESD_CHAR_DEVICE
     pthread_join(timestamp_thread_id, NULL);
+    #endif
+//    pthread_join(timestamp_thread_id, NULL);
+
     join_all_threads();
     close(listening_socket);
     pthread_mutex_destroy(&file_mutex);
     
+    #if !USE_AESD_CHAR_DEVICE    
     if (unlink(DATA_FILE) == -1) {
         syslog(LOG_ERR, "Failed to delete file %s: %s", DATA_FILE, strerror(errno));
     } else {
         syslog(LOG_INFO, "Deleted file %s", DATA_FILE);
     }
+    #endif
 
     closelog();
     return 0;

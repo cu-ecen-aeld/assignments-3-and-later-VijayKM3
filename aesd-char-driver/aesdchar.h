@@ -26,8 +26,24 @@
 struct aesd_dev
 {
     /**
-     * TODO: Add structure(s) and locks needed to complete assignment requirements
+     * TODO: Add structure(s) and locks needed to complete assignment requirements     
      */
+    //modification start 
+    #define AESD_HISTORY_MAX 10
+    char   *cmd_data[AESD_HISTORY_MAX];
+    size_t  cmd_len[AESD_HISTORY_MAX];
+    size_t  head;        /* index of oldest entry when cmd_count==AESD_HISTORY_MAX */
+    size_t  cmd_count;   /* number of valid entries (0..10) */
+    size_t  total_len;   /* sum of lengths of all valid entries, for read/seek */
+
+    /* in-progress (not yet newline-terminated) write accumulation */
+    char   *partial_buf;
+    size_t  partial_len;
+
+    /* lock to serialize read/write/open/close */
+    struct mutex *lock;
+    //modification end
+     
     struct cdev cdev;     /* Char device structure      */
 };
 
