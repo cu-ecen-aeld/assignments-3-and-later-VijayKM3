@@ -231,7 +231,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         void *nlp = memchr(ubuf + off, '\n', count - off);
         if (!nlp) {
             /* all remaining data is partial */
-            APPEND_TO_PARTIAL(ubuf + off, ubuf + count);
+            APPEND_TO_PARTIAL(ubuf + off, count - off);
             off = count;
             break;
         }
@@ -239,7 +239,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         /* append up to and including newline, then push as one complete command */
         {
             size_t upto = ((char *)nlp - (ubuf + off)) + 1; /* include '\n' */
-            APPEND_TO_PARTIAL(ubuf + off, ubuf + off + upto);
+            APPEND_TO_PARTIAL(ubuf + off, upto);
             off += upto;
             PUSH_COMPLETE();
         }
@@ -306,7 +306,7 @@ int aesd_init_module(void)
     aesd_device.partial_len = 0;
    // aesd_device.lock        = NULL; /* allocated lazily in open() */
     /* initialize the embedded mutex */
-+    mutex_init(&aesd_device.lock);
+    mutex_init(&aesd_device.lock);
     //modifications end
     
     result = aesd_setup_cdev(&aesd_device);
