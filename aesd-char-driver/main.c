@@ -188,19 +188,17 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
       mutex_lock(&dev->lock);
 
     /* Helper to append (bytes [s..e)) to dev->partial_buf */
-    #define APPEND_TO_PARTIAL(s,e)                                                   \
+    #define APPEND_TO_PARTIAL(s, add)                                                \
         do {                                                                         \
-            size_t add = (e) - (s);                                                  \
-          //  char *nb = kmalloc(dev->partial_len + add, GFP_KERNEL);                  
-            char *nb = kmalloc(dev->partial_len + add + 1, GFP_KERNEL);              \
+            char *nb = kmalloc(dev->partial_len + (add) + 1, GFP_KERNEL);            \
             if (!nb) { retval = -ENOMEM; goto out_unlock_free; }                     \
-            if (dev->partial_len) memcpy(nb, dev->partial_buf, dev->partial_len);    \
-            memcpy(nb + dev->partial_len, (s), add);                                 \
-            /* safe null-terminate for debugging/printing */
-            nb[dev->partial_len + add] = '\0';                                       \
+            if (dev->partial_len)                                                    \
+                memcpy(nb, dev->partial_buf, dev->partial_len);                      \
+            memcpy(nb + dev->partial_len, (s), (add));                               \
+            nb[dev->partial_len + (add)] = '\0';                                     \
             kfree(dev->partial_buf);                                                 \
             dev->partial_buf = nb;                                                   \
-            dev->partial_len += add;                                                 \
+            dev->partial_len += (add);                                               \
         } while (0)
 
     /* Helper to push a COMPLETE command in history (freeing oldest if needed) */
@@ -219,8 +217,8 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
             dev->cmd_data[ins_idx] = dev->partial_buf;                               \
             dev->cmd_len[ins_idx]  = dev->partial_len;                               \
             dev->total_len        += dev->partial_len;                                \
-            /* debug: show where entry landed and its length */
-            pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n", 
+            /* debug: show where entry landed and its length */                      \
+            pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n", \
                    ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx]);  \
             dev->partial_buf = NULL;                                                 \
             dev->partial_len = 0;                                                    \
