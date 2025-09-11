@@ -167,14 +167,18 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         kfree(dev->partial_buf);                                       \
         dev->partial_buf = nb;                                         \
         dev->partial_len = _newlen;                                    \
+        pr_info("aesd: APPENDED partial='%s' len=%zu\n",               \
+        dev->partial_buf ? dev->partial_buf : "(null)",                \
+        dev->partial_len);                                             \
     } while (0)
 
+
 /* Helper to push a COMPLETE command in history (freeing oldest if needed) */
-#define PUSH_COMPLETE()                                                     \
+#define PUSH_COMPLETE()                                                        \
  do {                                                                       \
     size_t ins_idx;                                                         \
     char *final;                                                            \
-    /* allocate exact bytes + NUL so the stored buffer is always safe */    \
+    /* allocate dev->partial_len + 1 so we can NUL-terminate the stored string */ \
     final = kmalloc(dev->partial_len + 1, GFP_KERNEL);                      \
     if (!final) { retval = -ENOMEM; goto out_unlock_free; }                 \
     memcpy(final, dev->partial_buf, dev->partial_len);                      \
@@ -193,10 +197,13 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     dev->total_len        += dev->partial_len;                              \
     pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n",\
            ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx]);  \
+    pr_info("aesd: STORED idx=%zu data='%s' len=%zu\n",                     \
+        ins_idx, dev->cmd_data[ins_idx], dev->cmd_len[ins_idx]);            \ 
     kfree(dev->partial_buf);                                                 \
     dev->partial_buf = NULL;                                                 \
     dev->partial_len = 0;                                                    \
  } while (0)
+
 
     /* Process the user buffer, possibly creating multiple complete commands
      * split on '\n'. Bytes after the last '\n' remain in partial_buf. */
