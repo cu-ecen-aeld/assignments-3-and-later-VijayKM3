@@ -45,13 +45,13 @@ int aesd_open(struct inode *inode, struct file *filp)
     filp->private_data = &aesd_device;
 
     /* lazily allocate/init the device mutex once */
-    if (!aesd_device.lock) {
-        struct mutex *m = kmalloc(sizeof(*m), GFP_KERNEL);
-        if (!m)
-            return -ENOMEM;
-        mutex_init(m);
-        aesd_device.lock = m;
-    }
+   // if (!aesd_device.lock) {
+   //     struct mutex *m = kmalloc(sizeof(*m), GFP_KERNEL);
+   //     if (!m)
+   //         return -ENOMEM;
+   //     mutex_init(m);
+   //     aesd_device.lock = m;
+   // }
     //modifications end
      
     return 0;
@@ -81,10 +81,12 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     size_t want, copied = 0, pos = 0;
     size_t remaining, idx, i;
 
-    if (!dev || !dev->lock)
+   // if (!dev || !dev->lock)
+     if (!dev)
         return -EIO;
 
-    mutex_lock(dev->lock);
+   // mutex_lock(dev->lock);
+     mutex_lock(&dev->lock);
 
     if (*f_pos >= dev->total_len) {
         retval = 0;                /* EOF */
@@ -144,7 +146,9 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     }
 
 out_unlock:
-    mutex_unlock(dev->lock);
+   // mutex_unlock(dev->lock);
+    mutex_unlock(&dev->lock);
+    
     return retval;
     //modifications end
     
@@ -164,7 +168,8 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     char *ubuf = NULL;
     size_t off = 0;
 
-    if (!dev || !dev->lock)
+   // if (!dev || !dev->lock)
+    if (!dev)
         return -EIO;
 
     if (count == 0)
@@ -179,16 +184,20 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         return -EFAULT;
     }
 
-    mutex_lock(dev->lock);
+   // mutex_lock(dev->lock);
+      mutex_lock(&dev->lock);
 
     /* Helper to append (bytes [s..e)) to dev->partial_buf */
     #define APPEND_TO_PARTIAL(s,e)                                                   \
         do {                                                                         \
             size_t add = (e) - (s);                                                  \
-            char *nb = kmalloc(dev->partial_len + add, GFP_KERNEL);                  \
+          //  char *nb = kmalloc(dev->partial_len + add, GFP_KERNEL);                  
+            char *nb = kmalloc(dev->partial_len + add + 1, GFP_KERNEL);              \
             if (!nb) { retval = -ENOMEM; goto out_unlock_free; }                     \
             if (dev->partial_len) memcpy(nb, dev->partial_buf, dev->partial_len);    \
             memcpy(nb + dev->partial_len, (s), add);                                 \
+            /* safe null-terminate for debugging/printing */
+            nb[dev->partial_len + add] = '\0';                                       \
             kfree(dev->partial_buf);                                                 \
             dev->partial_buf = nb;                                                   \
             dev->partial_len += add;                                                 \
@@ -210,6 +219,9 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
             dev->cmd_data[ins_idx] = dev->partial_buf;                               \
             dev->cmd_len[ins_idx]  = dev->partial_len;                               \
             dev->total_len        += dev->partial_len;                                \
+            /* debug: show where entry landed and its length */
+            pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n", 
+                   ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx]);  \
             dev->partial_buf = NULL;                                                 \
             dev->partial_len = 0;                                                    \
         } while (0)
@@ -238,7 +250,8 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     retval = count; /* per character driver convention, report bytes accepted */
 
     out_unlock_free:
-     mutex_unlock(dev->lock);
+    // mutex_unlock(dev->lock);
+     mutex_unlock(&dev->lock);
      kfree(ubuf);
      return retval;
        
@@ -293,7 +306,9 @@ int aesd_init_module(void)
     aesd_device.total_len  = 0;
     aesd_device.partial_buf = NULL;
     aesd_device.partial_len = 0;
-    aesd_device.lock        = NULL; /* allocated lazily in open() */
+   // aesd_device.lock        = NULL; /* allocated lazily in open() */
+    /* initialize the embedded mutex */
++    mutex_init(&aesd_device.lock);
     //modifications end
     
     result = aesd_setup_cdev(&aesd_device);
@@ -331,11 +346,11 @@ void aesd_cleanup_module(void)
     aesd_device.partial_len = 0;
 
     /* free the mutex if allocated */
-    if (aesd_device.lock) {
-        /* no explicit destroy needed for struct mutex */
-        kfree(aesd_device.lock);
-        aesd_device.lock = NULL;
-    }
+   // if (aesd_device.lock) {
+   //     /* no explicit destroy needed for struct mutex */
+   //     kfree(aesd_device.lock);
+   //     aesd_device.lock = NULL;
+   // }
     //modifications end
     
     unregister_chrdev_region(devno, 1);

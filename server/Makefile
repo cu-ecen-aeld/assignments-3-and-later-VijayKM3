@@ -3,6 +3,7 @@
 CC = $(CROSS_COMPILE)gcc
 
 CFLAGS = -D_GNU_SOURCE -Wall -Wextra -std=c11 -O2
+CFLAGS += -DUSE_AESD_CHAR_DEVICE=1
 
 TARGET = aesdsocket
 

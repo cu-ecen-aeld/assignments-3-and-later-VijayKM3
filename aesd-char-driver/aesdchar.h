@@ -41,7 +41,10 @@ struct aesd_dev
     size_t  partial_len;
 
     /* lock to serialize read/write/open/close */
-    struct mutex *lock;
+    //struct mutex *lock;
+    
+    /* lock to serialize read/write/open/close (embedded, initialized in init) */
++    struct mutex lock;
     //modification end
      
     struct cdev cdev;     /* Char device structure      */
