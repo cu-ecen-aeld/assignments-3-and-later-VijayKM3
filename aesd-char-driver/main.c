@@ -69,109 +69,71 @@ int aesd_release(struct inode *inode, struct file *filp)
 }
 
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
-                loff_t *f_pos)
+                  loff_t *f_pos)
 {
     ssize_t retval = 0;
-    PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle read
-     */
-    //modifications start
     struct aesd_dev *dev = filp->private_data;
-    size_t want, copied = 0, pos = 0;
-    size_t remaining, idx, i;
+    size_t copied = 0;
+    size_t idx, i;
+    size_t pos = 0; /* cumulative position in the history */
 
-   // if (!dev || !dev->lock)
-     if (!dev)
+    if (!dev)
         return -EIO;
 
-   // mutex_lock(dev->lock);
-     mutex_lock(&dev->lock);
+    mutex_lock(&dev->lock);
 
     if (*f_pos >= dev->total_len) {
-        retval = 0;                /* EOF */
+        retval = 0; /* EOF */
         goto out_unlock;
     }
 
-    remaining = dev->total_len - *f_pos;
-    want = (count < remaining) ? count : remaining;
+    /* Walk through commands in order */
+    idx = dev->head;
+    for (i = 0; i < dev->cmd_count && copied < count; i++) {
+        size_t entry = (idx + i) % AESD_HISTORY_MAX;
+        size_t elen  = dev->cmd_len[entry];
 
-    /* allocate a staging buffer for up to 'want' bytes */
-    {
-        char *kbuf = kmalloc(want, GFP_KERNEL);
-        if (!kbuf) {
-            retval = -ENOMEM;
+        if (pos + elen <= *f_pos) {
+            /* skip this entry completely */
+            pos += elen;
+            continue;
+        }
+
+        /* calculate start position inside this entry */
+        size_t start_in_entry = (*f_pos > pos) ? (*f_pos - pos) : 0;
+        size_t avail_in_entry = elen - start_in_entry;
+        size_t take = (count - copied < avail_in_entry) ? (count - copied) : avail_in_entry;
+
+        if (copy_to_user(buf + copied,
+                         dev->cmd_data[entry] + start_in_entry,
+                         take)) {
+            retval = -EFAULT;
             goto out_unlock;
         }
 
-        /* Walk the history in arrival order: oldest .. newest */
-        idx = dev->cmd_count == AESD_HISTORY_MAX ? dev->head : 0;
-
-        for (i = 0; i < dev->cmd_count && copied < want; i++) {
-            size_t entry = (idx + i) % AESD_HISTORY_MAX;
-            size_t elen  = dev->cmd_len[entry];
-
-            /* Skip entries entirely before *f_pos */
-            if (pos + elen <= *f_pos) {
-                pos += elen;
-                continue;
-            }
-
-            /* Start within this entry */
-            {
-                size_t start_in_entry = (*f_pos > pos) ? (*f_pos - pos) : 0;
-                size_t avail_in_entry = elen - start_in_entry;
-                size_t take = (want - copied < avail_in_entry) ? (want - copied) : avail_in_entry;
-
-                memcpy(kbuf + copied,
-                       dev->cmd_data[entry] + start_in_entry,
-                       take);
-                copied += take;
-                pos += elen;
-            }
-        }
-
-        if (copied) {
-            if (copy_to_user(buf, kbuf, copied))
-                retval = -EFAULT;
-            else {
-                *f_pos += copied;
-                retval = copied;
-            }
-        } else {
-            retval = 0; /* nothing more to read */
-        }
-
-        kfree(kbuf);
+        copied += take;
+        *f_pos += take;
+        pos += elen;
     }
 
+    retval = copied;
+
 out_unlock:
-   // mutex_unlock(dev->lock);
     mutex_unlock(&dev->lock);
-    
-    return retval;
-    //modifications end
-    
     return retval;
 }
 
+
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
-                loff_t *f_pos)
+                   loff_t *f_pos)
 {
     ssize_t retval = -ENOMEM;
-    PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle write
-     */
-    //modifications start
     struct aesd_dev *dev = filp->private_data;
     char *ubuf = NULL;
     size_t off = 0;
 
-   // if (!dev || !dev->lock)
     if (!dev)
         return -EIO;
-
     if (count == 0)
         return 0;
 
@@ -184,40 +146,37 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         return -EFAULT;
     }
 
-   // mutex_lock(dev->lock);
-      mutex_lock(&dev->lock);
+    mutex_lock(&dev->lock);
 
     /* Helper to append (bytes [s..e)) to dev->partial_buf */
-    #define APPEND_TO_PARTIAL(s, add)                                                \
-        do {                                                                         \
-            char *nb = kmalloc(dev->partial_len + (add) + 1, GFP_KERNEL);            \
-            if (!nb) { retval = -ENOMEM; goto out_unlock_free; }                     \
-            if (dev->partial_len)                                                    \
-                memcpy(nb, dev->partial_buf, dev->partial_len);                      \
-            memcpy(nb + dev->partial_len, (s), (add));                               \
-            nb[dev->partial_len + (add)] = '\0';                                     \
-            kfree(dev->partial_buf);                                                 \
-            dev->partial_buf = nb;                                                   \
-            dev->partial_len += (add);                                               \
+    #define APPEND_TO_PARTIAL(s, add)                                      \
+        do {                                                               \
+            char *nb = kmalloc(dev->partial_len + (add) + 1, GFP_KERNEL);  \
+            if (!nb) { retval = -ENOMEM; goto out_unlock_free; }           \
+            if (dev->partial_len)                                          \
+                memcpy(nb, dev->partial_buf, dev->partial_len);            \
+            memcpy(nb + dev->partial_len, (s), (add));                     \
+            nb[dev->partial_len + (add)] = '\0';                           \
+            kfree(dev->partial_buf);                                       \
+            dev->partial_buf = nb;                                         \
+            dev->partial_len += (add);                                     \
         } while (0)
 
     /* Helper to push a COMPLETE command in history (freeing oldest if needed) */
     #define PUSH_COMPLETE()                                                          \
         do {                                                                         \
             size_t ins_idx;                                                          \
-            /* if we already have 10, drop the oldest */                             \
             if (dev->cmd_count == AESD_HISTORY_MAX) {                                \
                 kfree(dev->cmd_data[dev->head]);                                     \
                 dev->total_len -= dev->cmd_len[dev->head];                           \
                 dev->head = (dev->head + 1) % AESD_HISTORY_MAX;                      \
-            } else {                                                                  \
+            } else {                                                                 \
                 dev->cmd_count++;                                                    \
-            }                                                                         \
+            }                                                                        \
             ins_idx = (dev->head + dev->cmd_count - 1) % AESD_HISTORY_MAX;           \
             dev->cmd_data[ins_idx] = dev->partial_buf;                               \
             dev->cmd_len[ins_idx]  = dev->partial_len;                               \
-            dev->total_len        += dev->partial_len;                                \
-            /* debug: show where entry landed and its length */                      \
+            dev->total_len        += dev->partial_len;                               \
             pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n", \
                    ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx]);  \
             dev->partial_buf = NULL;                                                 \
@@ -227,36 +186,33 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     /* Process the user buffer, possibly creating multiple complete commands
      * split on '\n'. Bytes after the last '\n' remain in partial_buf. */
     while (off < count) {
-        /* find next newline in ubuf[off..count) */
         void *nlp = memchr(ubuf + off, '\n', count - off);
+
         if (!nlp) {
-            /* all remaining data is partial */
+            /* no newline: append all remaining data to partial */
             APPEND_TO_PARTIAL(ubuf + off, count - off);
             off = count;
             break;
-        }
-
-        /* append up to and including newline, then push as one complete command */
-        {
-            size_t upto = ((char *)nlp - (ubuf + off)) + 1; /* include '\n' */
+        } else {
+            /* found a newline: append chunk INCLUDING newline */
+            size_t upto = ((char *)nlp - (ubuf + off)) + 1;
             APPEND_TO_PARTIAL(ubuf + off, upto);
             off += upto;
+
+            /* now we have a complete command: push into history */
             PUSH_COMPLETE();
         }
     }
 
-    retval = count; /* per character driver convention, report bytes accepted */
+    retval = count;  /* report number of bytes accepted */
 
-    out_unlock_free:
-    // mutex_unlock(dev->lock);
-     mutex_unlock(&dev->lock);
-     kfree(ubuf);
-     return retval;
-       
-    //modifications end
-     
+out_unlock_free:
+    mutex_unlock(&dev->lock);
+    kfree(ubuf);
     return retval;
 }
+
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
