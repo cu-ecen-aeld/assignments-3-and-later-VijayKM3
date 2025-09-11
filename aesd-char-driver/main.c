@@ -82,6 +82,12 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 
     mutex_lock(&dev->lock);
 
+    if (dev->cmd_count > AESD_HISTORY_MAX) {
+    pr_warn("aesd: cmd_count corrupt: %zu, resetting\n", dev->cmd_count);
+    dev->cmd_count = AESD_HISTORY_MAX;
+}
+
+
     if (*f_pos >= dev->total_len) {
         retval = 0; /* EOF */
         goto out_unlock;
@@ -149,46 +155,50 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     mutex_lock(&dev->lock);
 
     /* Helper to append (bytes [s..e)) to dev->partial_buf */
+    /* Helper to append (bytes [s..e)) to dev->partial_buf */
     #define APPEND_TO_PARTIAL(s, add)                                      \
-        do {                                                               \
-            char *nb = kmalloc(dev->partial_len + (add) + 1, GFP_KERNEL);  \
-            if (!nb) { retval = -ENOMEM; goto out_unlock_free; }           \
-            if (dev->partial_len)                                          \
-                memcpy(nb, dev->partial_buf, dev->partial_len);            \
-            memcpy(nb + dev->partial_len, (s), (add));                     \
-            nb[dev->partial_len + (add)] = '\0';                           \
-            kfree(dev->partial_buf);                                       \
-            dev->partial_buf = nb;                                         \
-            dev->partial_len += (add);                                     \
-        } while (0)
+    do {                                                               \
+        size_t _newlen = dev->partial_len + (add);                     \
+        char *nb = kmalloc(_newlen + 1, GFP_KERNEL);                   \
+        if (!nb) { retval = -ENOMEM; goto out_unlock_free; }           \
+        if (dev->partial_len)                                           \
+            memcpy(nb, dev->partial_buf, dev->partial_len);            \
+        memcpy(nb + dev->partial_len, (s), (add));                     \
+        nb[_newlen] = '\0';                                            \
+        kfree(dev->partial_buf);                                       \
+        dev->partial_buf = nb;                                         \
+        dev->partial_len = _newlen;                                    \
+    } while (0)
 
     /* Helper to push a COMPLETE command in history (freeing oldest if needed) */
-    #define PUSH_COMPLETE()                                                        \
-     do {                                                                       \
-        size_t ins_idx;                                                        \
-        char *final;                                                           \
-        /* duplicate the string before storing */                              \
-        final = kmalloc(dev->partial_len, GFP_KERNEL);                         \
-        if (!final) { retval = -ENOMEM; goto out_unlock_free; }                \
-        memcpy(final, dev->partial_buf, dev->partial_len);                     \
-        /* if full, drop oldest */                                             \
-        if (dev->cmd_count == AESD_HISTORY_MAX) {                              \
-            kfree(dev->cmd_data[dev->head]);                                   \
-            dev->total_len -= dev->cmd_len[dev->head];                         \
-            dev->head = (dev->head + 1) % AESD_HISTORY_MAX;                    \
-        } else {                                                               \
-            dev->cmd_count++;                                                  \
-        }                                                                      \
-        ins_idx = (dev->head + dev->cmd_count - 1) % AESD_HISTORY_MAX;         \
-        dev->cmd_data[ins_idx] = final;                                        \
-        dev->cmd_len[ins_idx]  = dev->partial_len;                             \
-        dev->total_len        += dev->partial_len;                             \
-        pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n",\
-               ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx]);\
-        kfree(dev->partial_buf);                                               \
-        dev->partial_buf = NULL;                                               \
-        dev->partial_len = 0;                                                  \
-    } while (0)
+/* Helper to push a COMPLETE command in history (freeing oldest if needed) */
+#define PUSH_COMPLETE()                                                     \
+ do {                                                                       \
+    size_t ins_idx;                                                         \
+    char *final;                                                            \
+    /* allocate exact bytes + NUL so the stored buffer is always safe */    \
+    final = kmalloc(dev->partial_len + 1, GFP_KERNEL);                      \
+    if (!final) { retval = -ENOMEM; goto out_unlock_free; }                 \
+    memcpy(final, dev->partial_buf, dev->partial_len);                      \
+    final[dev->partial_len] = '\0';                                         \
+    /* if full, drop oldest */                                              \
+    if (dev->cmd_count == AESD_HISTORY_MAX) {                               \
+        kfree(dev->cmd_data[dev->head]);                                    \
+        dev->total_len -= dev->cmd_len[dev->head];                          \
+        dev->head = (dev->head + 1) % AESD_HISTORY_MAX;                     \
+    } else {                                                                 \
+        dev->cmd_count++;                                                    \
+    }                                                                        \
+    ins_idx = (dev->head + dev->cmd_count - 1) % AESD_HISTORY_MAX;           \
+    dev->cmd_data[ins_idx] = final;                                         \
+    dev->cmd_len[ins_idx]  = dev->partial_len;                              \
+    dev->total_len        += dev->partial_len;                              \
+    pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n",\
+           ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx]);  \
+    kfree(dev->partial_buf);                                                 \
+    dev->partial_buf = NULL;                                                 \
+    dev->partial_len = 0;                                                    \
+ } while (0)
 
 
     /* Process the user buffer, possibly creating multiple complete commands
