@@ -44,7 +44,7 @@ struct aesd_dev
     //struct mutex *lock;
     
     /* lock to serialize read/write/open/close (embedded, initialized in init) */
-+    struct mutex lock;
+    struct mutex lock;
     //modification end
      
     struct cdev cdev;     /* Char device structure      */
