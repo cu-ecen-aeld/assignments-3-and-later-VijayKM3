@@ -153,8 +153,8 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 
     mutex_lock(&dev->lock);
 
-    /* Helper to append (bytes [s..e)) to dev->partial_buf */
 /* Helper to append (bytes [s..e)) to dev->partial_buf */
+/* Append bytes [s .. s+add) to partial buffer (safe, NUL-terminated) */
 #define APPEND_TO_PARTIAL(s, add)                                      \
     do {                                                               \
         size_t _newlen = dev->partial_len + (add);                     \
@@ -167,24 +167,25 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         kfree(dev->partial_buf);                                       \
         dev->partial_buf = nb;                                         \
         dev->partial_len = _newlen;                                    \
-        pr_info("aesd: APPENDED partial='%s' len=%zu\n",               \
-        dev->partial_buf ? dev->partial_buf : "(null)",                \
-        dev->partial_len);                                             \
+        /* debug: always print what partial contains after append */   \
+        pr_err("aesd: APPENDED partial=\"%s\" add=%zu total_partial_len=%zu\n", \
+               dev->partial_buf ? dev->partial_buf : "(null)", (size_t)(add), dev->partial_len); \
     } while (0)
 
-
 /* Helper to push a COMPLETE command in history (freeing oldest if needed) */
-#define PUSH_COMPLETE()                                                        \
+/* Push the current partial buffer into the circular history */
+#define PUSH_COMPLETE()                                                      \
  do {                                                                       \
     size_t ins_idx;                                                         \
     char *final;                                                            \
-    /* allocate dev->partial_len + 1 so we can NUL-terminate the stored string */ \
+    /* allocate with +1 and NUL terminate */                                \
     final = kmalloc(dev->partial_len + 1, GFP_KERNEL);                      \
     if (!final) { retval = -ENOMEM; goto out_unlock_free; }                 \
     memcpy(final, dev->partial_buf, dev->partial_len);                      \
     final[dev->partial_len] = '\0';                                         \
-    /* if full, drop oldest */                                              \
+    /* free oldest if full */                                               \
     if (dev->cmd_count == AESD_HISTORY_MAX) {                               \
+        pr_err("aesd: PUSH_COMPLETE dropping oldest idx=%zu len=%zu\n", dev->head, dev->cmd_len[dev->head]); \
         kfree(dev->cmd_data[dev->head]);                                    \
         dev->total_len -= dev->cmd_len[dev->head];                          \
         dev->head = (dev->head + 1) % AESD_HISTORY_MAX;                     \
@@ -195,15 +196,12 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     dev->cmd_data[ins_idx] = final;                                         \
     dev->cmd_len[ins_idx]  = dev->partial_len;                              \
     dev->total_len        += dev->partial_len;                              \
-    pr_info("aesd: PUSH_COMPLETE idx=%zu count=%zu total_len=%zu len=%zu\n",\
-           ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx]);  \
-    pr_info("aesd: STORED idx=%zu data='%s' len=%zu\n",                     \
-        ins_idx, dev->cmd_data[ins_idx], dev->cmd_len[ins_idx]);            \ 
+    pr_err("aesd: PUSH_COMPLETE stored idx=%zu count=%zu total_len=%zu len=%zu data='%s'\n", \
+           ins_idx, dev->cmd_count, dev->total_len, dev->cmd_len[ins_idx], dev->cmd_data[ins_idx]); \
     kfree(dev->partial_buf);                                                 \
     dev->partial_buf = NULL;                                                 \
     dev->partial_len = 0;                                                    \
  } while (0)
-
 
     /* Process the user buffer, possibly creating multiple complete commands
      * split on '\n'. Bytes after the last '\n' remain in partial_buf. */
