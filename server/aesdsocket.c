@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include "aesd_ioctl.h"
+#include <stdbool.h>
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
@@ -162,6 +164,21 @@ void *handle_connection(void *arg) {
     inet_ntop(AF_INET, &(client_address.sin_addr), client_ip, INET_ADDRSTRLEN);
     syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
+     /* Open the device ONCE per connection when using the char driver.
+      * Reuse the same fd for ioctl + read to honor the file position. */
+ #if USE_AESD_CHAR_DEVICE
+     int data_fd = open(DATA_FILE, O_RDWR);
+     if (data_fd == -1) {
+         syslog(LOG_ERR, "open %s failed: %s", DATA_FILE, strerror(errno));
+         close(client_socket);
+         if (packet_buffer) free(packet_buffer);
+         free(data);
+         return NULL;
+     }
+ #else
+     int data_fd = -1; /* not used in /var/tmp mode */
+ #endif
+
     ssize_t bytes_received = 0;
     while (!g_exit_signal_received && (bytes_received = recv(client_socket, recv_buffer, BUFFER_SIZE, 0)) > 0) {
         
@@ -193,7 +210,7 @@ void *handle_connection(void *arg) {
                 break;
             }
             
-            int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+/*            int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd == -1) {
                 syslog(LOG_ERR, "Failed to open or create file %s: %s", DATA_FILE, strerror(errno));
                 pthread_mutex_unlock(&file_mutex); // Unlock on error
@@ -208,7 +225,51 @@ void *handle_connection(void *arg) {
                 syslog(LOG_ERR, "fsync failed: %s", strerror(errno));
             }
             close(fd);
-            
+  */          
+               /* special control line: AESDCHAR_IOCSEEKTO:X,Y  */
+             bool handled_ioctl = false;
+ #if USE_AESD_CHAR_DEVICE
+             const char prefix[] = "AESDCHAR_IOCSEEKTO:";
+             if (packet_len > strlen(prefix) &&
+                 !strncmp(packet_buffer, prefix, strlen(prefix))) {
+                 unsigned x, y;
+                 if (sscanf(packet_buffer + strlen(prefix), "%u,%u", &x, &y) == 2) {
+                     struct aesd_seekto seekto = { .write_cmd = x, .write_cmd_offset = y };
+                     if (ioctl(data_fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+                         syslog(LOG_ERR, "ioctl AESDCHAR_IOCSEEKTO failed: %s", strerror(errno));
+                     } else {
+                         handled_ioctl = true;  /* DO NOT write this control line */
+                     }
+                 }
+             }
+ #endif
+ 
+             /* Normal write path if not an ioctl control line */
+             if (!handled_ioctl) {
+ #if USE_AESD_CHAR_DEVICE
+                 if (write(data_fd, packet_buffer, packet_len) == -1) {
+                     syslog(LOG_ERR, "Failed to write to %s: %s", DATA_FILE, strerror(errno));
+                 }
+                 if (fsync(data_fd) == -1) {
+                     syslog(LOG_ERR, "fsync failed: %s", strerror(errno));
+                 }
+ #else
+                 int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                 if (fd == -1) {
+                     syslog(LOG_ERR, "Failed to open or create file %s: %s", DATA_FILE, strerror(errno));
+                     pthread_mutex_unlock(&file_mutex);
+                     break;
+                 }
+                 if (write(fd, packet_buffer, packet_len) == -1) {
+                     syslog(LOG_ERR, "Failed to write to file %s: %s", DATA_FILE, strerror(errno));
+                 }
+                 if (fsync(fd) == -1) {
+                     syslog(LOG_ERR, "fsync failed: %s", strerror(errno));
+                 }
+                 close(fd);
+ #endif
+             }
+  
             // Unlock the mutex after writing
             if (pthread_mutex_unlock(&file_mutex) != 0) {
                 syslog(LOG_ERR, "Failed to unlock mutex: %s", strerror(errno));
@@ -220,6 +281,7 @@ void *handle_connection(void *arg) {
                 break;
             }
 
+/*
             int read_fd = open(DATA_FILE, O_RDONLY);
             if (read_fd == -1) {
                 syslog(LOG_ERR, "Failed to open file %s for reading: %s", DATA_FILE, strerror(errno));
@@ -248,6 +310,48 @@ void *handle_connection(void *arg) {
                 }
                 close(read_fd);
             }
+  */
+               /* read back using SAME fd (device) without resetting to start */
+ #if USE_AESD_CHAR_DEVICE
+             {
+                 char file_buffer[BUFFER_SIZE];
+                 ssize_t read_bytes_from_file = 0;
+                 while (!g_exit_signal_received &&
+                        (read_bytes_from_file = read(data_fd, file_buffer, BUFFER_SIZE)) > 0) {
+                     ssize_t sent_bytes = 0;
+                     while (sent_bytes < read_bytes_from_file) {
+                         ssize_t current_sent = send(client_socket, file_buffer + sent_bytes,
+                                                     read_bytes_from_file - sent_bytes, 0);
+                         if (current_sent == -1) {
+                             syslog(LOG_ERR, "send failed: %s", strerror(errno));
+                             break;
+                         }
+                         sent_bytes += current_sent;
+                     }
+                     if (sent_bytes < read_bytes_from_file) break;
+                 }
+                 if (read_bytes_from_file == -1) {
+                     syslog(LOG_ERR, "read failed on %s: %s", DATA_FILE, strerror(errno));
+                 }
+             }
+ #else
+             int read_fd = open(DATA_FILE, O_RDONLY);
+             if (read_fd == -1) {
+                 syslog(LOG_ERR, "Failed to open file %s for reading: %s", DATA_FILE, strerror(errno));
+             } else {
+                 lseek(read_fd, 0, SEEK_SET);
+                 char file_buffer[BUFFER_SIZE];
+                 ssize_t n;
+                 while (!g_exit_signal_received && (n = read(read_fd, file_buffer, sizeof file_buffer)) > 0) {
+                     if (send(client_socket, file_buffer, n, 0) == -1) {
+                         syslog(LOG_ERR, "send failed: %s", strerror(errno));
+                         break;
+                     }
+                 }
+                 if (n == -1) syslog(LOG_ERR, "read failed on %s: %s", DATA_FILE, strerror(errno));
+                 close(read_fd);
+             }
+ #endif
             // Unlock the mutex after reading
             if (pthread_mutex_unlock(&file_mutex) != 0) {
                 syslog(LOG_ERR, "Failed to unlock mutex: %s", strerror(errno));
@@ -262,7 +366,7 @@ void *handle_connection(void *arg) {
     // Check if connection was closed with data still in buffer
     if (bytes_received == 0 && packet_buffer_len > 0) {
         if (pthread_mutex_lock(&file_mutex) == 0) {
-            int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+ /*           int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd != -1) {
                 if (write(fd, packet_buffer, packet_buffer_len) == -1) {
                      syslog(LOG_ERR, "Failed to write remaining data to file %s: %s", DATA_FILE, strerror(errno));
@@ -275,6 +379,29 @@ void *handle_connection(void *arg) {
             } else {
                  syslog(LOG_ERR, "Failed to open file for remaining data %s: %s", DATA_FILE, strerror(errno));
             }
+  */
+   #if USE_AESD_CHAR_DEVICE
+             if (write(data_fd, packet_buffer, packet_buffer_len) == -1) {
+                 syslog(LOG_ERR, "Failed to write remaining data to %s: %s", DATA_FILE, strerror(errno));
+             }
+             if (fsync(data_fd) == -1) {
+                 syslog(LOG_ERR, "fsync failed: %s", strerror(errno));
+             }
+ #else
+             int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+             if (fd != -1) {
+                 if (write(fd, packet_buffer, packet_buffer_len) == -1) {
+                      syslog(LOG_ERR, "Failed to write remaining data to file %s: %s", DATA_FILE, strerror(errno));
+                 }
+                 if (fsync(fd) == -1) {
+                     syslog(LOG_ERR, "fsync failed: %s", strerror(errno));
+                 }
+                 close(fd);
+             } else {
+                  syslog(LOG_ERR, "Failed to open file for remaining data %s: %s", DATA_FILE, strerror(errno));
+             }
+ #endif
+
             pthread_mutex_unlock(&file_mutex);
         } else {
             syslog(LOG_ERR, "Failed to lock mutex for final write: %s", strerror(errno));
@@ -294,6 +421,12 @@ void *handle_connection(void *arg) {
     // Free the thread data structure
     free(data);
     
+     #if USE_AESD_CHAR_DEVICE
+     if (data_fd != -1) {
+         close(data_fd);
+     }
+     #endif
+
     return NULL;
 }
 

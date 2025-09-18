@@ -11,6 +11,7 @@
  *
  */
 
+#include "aesd_ioctl.h"
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/printk.h>
@@ -232,6 +233,92 @@ out_unlock_free:
     return retval;
 }
 
+static loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+    loff_t newpos;
+    struct aesd_dev *dev = filp->private_data;
+
+    if (!dev) return -EIO;
+    mutex_lock(&dev->lock);
+
+    switch (whence) {
+    case SEEK_SET:
+        newpos = off;
+        break;
+    case SEEK_CUR:
+        newpos = filp->f_pos + off;
+        break;
+    case SEEK_END:
+        newpos = (loff_t)dev->total_len + off;
+        break;
+    default:
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    if (newpos < 0 || newpos > dev->total_len) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+    filp->f_pos = newpos;
+    mutex_unlock(&dev->lock);
+    return newpos;
+}
+
+static long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_seekto seekto;
+    size_t newpos = 0;
+    size_t i;
+
+    if (!dev) return -EIO;
+
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC || _IOC_NR(cmd) > AESDCHAR_IOC_MAXNR)
+        return -ENOTTY;
+
+    switch (cmd) {
+    case AESDCHAR_IOCSEEKTO:
+        if (copy_from_user(&seekto, (void __user *)arg, sizeof(seekto)))
+            return -EFAULT;
+
+        mutex_lock(&dev->lock);
+
+        if (seekto.write_cmd >= dev->cmd_count) {
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }
+
+        /* absolute ring index of target command */
+        {
+            size_t entry_idx = (dev->head + seekto.write_cmd) % AESD_HISTORY_MAX;
+            if (seekto.write_cmd_offset > dev->cmd_len[entry_idx]) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+        }
+
+        /* sum lengths of all commands before the target */
+        for (i = 0; i < seekto.write_cmd; i++) {
+            size_t idx = (dev->head + i) % AESD_HISTORY_MAX;
+            newpos += dev->cmd_len[idx];
+        }
+        newpos += seekto.write_cmd_offset;
+
+        if (newpos > dev->total_len) { /* paranoia */
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }
+
+        filp->f_pos = newpos;
+        mutex_unlock(&dev->lock);
+        return 0;
+
+    default:
+        return -ENOTTY;
+    }
+}
+
 
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
@@ -239,6 +326,8 @@ struct file_operations aesd_fops = {
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek         = aesd_llseek,          /* NEW */
+    .unlocked_ioctl = aesd_unlocked_ioctl,  /* NEW */
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
